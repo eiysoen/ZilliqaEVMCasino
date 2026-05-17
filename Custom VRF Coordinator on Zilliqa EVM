@@ -1,1 +1,145 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+// Interfaces mirroring the official Chainlink VRF V2
+interface VRFCoordinatorV2Interface {
+    function getRequestConfig() external view returns (uint16, uint32, bytes32[] memory);
+    function requestRandomWords(bytes32 keyHash, uint64 subId, uint16 minimumRequestConfirmations, uint32 callbackGasLimit, uint32 numWords) external returns (uint256 requestId);
+    function createSubscription() external returns (uint64 subId);
+    function getSubscription(uint64 subId) external view returns (uint96 balance, uint64 reqCount, address owner, address[] memory consumers);
+    function requestSubscriptionOwnerTransfer(uint64 subId, address newOwner) external;
+    function acceptSubscriptionOwnerTransfer(uint64 subId) external;
+    function addConsumer(uint64 subId, address consumer) external;
+    function removeConsumer(uint64 subId, address consumer) external;
+    function cancelSubscription(uint64 subId, address to) external;
+    function pendingRequestExists(uint64 subId) external view returns (bool);
+}
+
+interface VRFConsumerBaseV2Interface {
+    function rawFulfillRandomWords(uint256 requestId, uint256[] memory randomWords) external;
+}
+
+/**
+ * @title ZilliqaEVM_VRFCoordinatorMock
+ * @dev An advanced standalone VRF Coordinator for networks without official Chainlink support.
+ */
+contract ZilliqaEVM_VRFCoordinatorMock is VRFCoordinatorV2Interface, Ownable {
+    
+    uint96 public constant BASE_FEE = 0.1 ether; // Mock fee in ZIL/Wei
+    uint96 public constant GAS_PRICE_LINK = 1e9; // Mock gas price
+
+    uint64 private s_currentSubId;
+    uint256 private s_nextRequestId = 1;
+
+    struct Subscription {
+        uint96 balance;
+        uint64 reqCount;
+        address owner;
+        mapping(address => bool) consumers;
+        address[] consumersList;
+    }
+
+    mapping(uint64 => Subscription) private s_subscriptions;
+    
+    struct Request {
+        address consumer;
+        uint64 subId;
+        uint32 numWords;
+    }
+    
+    mapping(uint256 => Request) private s_requests;
+
+    // Events identical to official Chainlink for backend listening
+    event RandomWordsRequested(bytes32 indexed keyHash, uint256 requestId, uint256 preSeed, uint64 indexed subId, uint16 minimumRequestConfirmations, uint32 callbackGasLimit, uint32 numWords, address indexed sender);
+    event RandomWordsFulfilled(uint256 indexed requestId, uint256 outputSeed, uint96 payment, bool success);
+    event SubscriptionCreated(uint64 indexed subId, address owner);
+    event SubscriptionFunded(uint64 indexed subId, uint256 oldBalance, uint256 newBalance);
+    event ConsumerAdded(uint64 indexed subId, address consumer);
+
+    constructor() Ownable(msg.sender) {}
+
+    // --- SUBSCRIPTION MANAGEMENT ---
+
+    function createSubscription() external override returns (uint64 subId) {
+        s_currentSubId++;
+        s_subscriptions[s_currentSubId].owner = msg.sender;
+        emit SubscriptionCreated(s_currentSubId, msg.sender);
+        return s_currentSubId;
+    }
+
+    function fundSubscription(uint64 subId) external payable {
+        require(s_subscriptions[subId].owner != address(0), "Invalid subscription");
+        uint256 oldBalance = s_subscriptions[subId].balance;
+        s_subscriptions[subId].balance += uint96(msg.value);
+        emit SubscriptionFunded(subId, oldBalance, oldBalance + msg.value);
+    }
+
+    function addConsumer(uint64 subId, address consumer) external override {
+        require(s_subscriptions[subId].owner == msg.sender, "Must be sub owner");
+        require(!s_subscriptions[subId].consumers[consumer], "Already added");
+        s_subscriptions[subId].consumers[consumer] = true;
+        s_subscriptions[subId].consumersList.push(consumer);
+        emit ConsumerAdded(subId, consumer);
+    }
+
+    // --- REQUEST AND FULFILLMENT (ORACLE LOGIC) ---
+
+    function requestRandomWords(
+        bytes32 keyHash,
+        uint64 subId,
+        uint16 minimumRequestConfirmations,
+        uint32 callbackGasLimit,
+        uint32 numWords
+    ) external override returns (uint256 requestId) {
+        require(s_subscriptions[subId].owner != address(0), "Invalid subscription");
+        require(s_subscriptions[subId].consumers[msg.sender], "Not a valid consumer");
+        
+        // In a real scenario, you'd calculate fees here and deduct from sub balance.
+        
+        requestId = s_nextRequestId++;
+        s_requests[requestId] = Request({
+            consumer: msg.sender,
+            subId: subId,
+            numWords: numWords
+        });
+
+        // Your off-chain Node.js server will listen to this event!
+        emit RandomWordsRequested(
+            keyHash, requestId, 0, subId, minimumRequestConfirmations, callbackGasLimit, numWords, msg.sender
+        );
+
+        return requestId;
+    }
+
+    /**
+     * @notice This function is called by your OFF-CHAIN Node.js server.
+     * @dev Only the contract owner (the Oracle operator) can push the random numbers.
+     */
+    function fulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) external onlyOwner {
+        Request memory req = s_requests[requestId];
+        require(req.consumer != address(0), "Request not found");
+        require(randomWords.length == req.numWords, "Invalid words length");
+
+        // Execute the callback to the Casino Contract
+        VRFConsumerBaseV2Interface consumer = VRFConsumerBaseV2Interface(req.consumer);
+        
+        // We use low-level call to prevent consumer reverting and blocking the oracle
+        (bool success, ) = address(consumer).call(
+            abi.encodeWithSelector(consumer.rawFulfillRandomWords.selector, requestId, randomWords)
+        );
+
+        emit RandomWordsFulfilled(requestId, randomWords[0], 0, success);
+    }
+
+    // --- DUMMY INTERFACE IMPLEMENTATIONS TO SATISFY COMPILER ---
+    function getRequestConfig() external pure override returns (uint16, uint32, bytes32[] memory) { return (3, 2000000, new bytes32[](0)); }
+    function getSubscription(uint64 subId) external view override returns (uint96 balance, uint64 reqCount, address owner, address[] memory consumers) { return (s_subscriptions[subId].balance, s_subscriptions[subId].reqCount, s_subscriptions[subId].owner, s_subscriptions[subId].consumersList); }
+    function requestSubscriptionOwnerTransfer(uint64, address) external pure override {}
+    function acceptSubscriptionOwnerTransfer(uint64) external pure override {}
+    function removeConsumer(uint64, address) external pure override {}
+    function cancelSubscription(uint64, address) external pure override {}
+    function pendingRequestExists(uint64) external pure override returns (bool) { return false; }
+}
 
